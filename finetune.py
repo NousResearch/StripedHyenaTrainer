@@ -116,7 +116,9 @@ def main(args):
     else:
         optimizer_grouped_parameters = list(model.parameters())
 
-    warmup_steps = args.warmup_steps * accelerator.num_processes
+    warmup_steps = args.warmup_steps
+    if accelerator.distributed_type != DistributedType.DEEPSPEED:
+        warmup_steps *= accelerator.num_processes
 
     if accelerator.distributed_type != DistributedType.DEEPSPEED:
         model = accelerator.prepare(model)
@@ -213,7 +215,7 @@ def main(args):
                                 args.output_dir, output_dir)
                         accelerator.save_state(output_dir)
 
-            if completed_steps >= num_training_steps:
+            if completed_steps >= num_training_steps * args.epochs:
                 break
 
         accelerator.print("Training Finished")
