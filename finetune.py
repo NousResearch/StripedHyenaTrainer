@@ -5,7 +5,7 @@ import os
 from datasets import load_dataset, load_from_disk, DatasetDict
 from datetime import timedelta
 from torch.utils.data import DataLoader
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedType
 from accelerate.utils import InitProcessGroupKwargs, set_seed, DummyOptim, DummyScheduler
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, set_seed as transformers_set_seed, \
@@ -86,49 +86,60 @@ def main(args):
     total_batch_size = args.batch_size * accelerator.num_processes * args.gradient_accumulate_every
     epoch_size = args.max_train_steps if args.max_train_steps else len(train_dataset)
     num_training_steps = args.max_train_steps if args.max_train_steps else epoch_size * args.epochs // total_batch_size
-
     accelerator.print(f"Total batch size: {total_batch_size}")
     accelerator.print(f"Training steps: {num_training_steps}")
 
     param_optimizer = list(model.named_parameters())
-    no_decay = args.no_decay[0]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay if args.weight_decay else 0.0,
-        },
-        {
-            "params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0
-        },
-    ]
+    frozen = args.frozen[0] if args.frozen else []
+    frozen_parameter_names = [n for n, p in param_optimizer if any(nd in n for nd in frozen)]
+    if len(frozen_parameter_names) > 0:
+        accelerator.print(f"Frozen parameters: {frozen_parameter_names}")
+    for n, p in param_optimizer:
+        if any(nd in n for nd in frozen):
+            p.requires_grad = False
 
-    if args.deepspeed:
-        optim = DummyOptim(optimizer_grouped_parameters, lr=args.learning_rate,
-                           betas=(args.adamw_beta1, args.adamw_beta2), eps=args.adamw_eps)
-        scheduler = DummyScheduler(
-            optim, num_training_steps=num_training_steps, num_warmup_steps=args.warmup_steps)
-        model, optim, train_loader, scheduler = accelerator.prepare(
-            model, optim, train_loader, scheduler
-        )
+    no_decay = args.no_decay[0] if args.no_decay else []
+    if len(no_decay) > 0:
+        undecayed_parameter_names = [n for n, p in param_optimizer if any(nd in n for nd in no_decay)]
+        if len(undecayed_parameter_names) > 0:
+            accelerator.print(f"Undecayed parameters: {undecayed_parameter_names}")
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+                "weight_decay": args.weight_decay if args.weight_decay else 0.0,
+            },
+            {
+                "params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0
+            },
+        ]
     else:
+        optimizer_grouped_parameters = list(model.parameters())
+
+    warmup_steps = args.warmup_steps * accelerator.num_processes
+
+    if accelerator.distributed_type != DistributedType.DEEPSPEED:
         model = accelerator.prepare(model)
-        optim = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate,
-                                  betas=(args.adamw_beta1, args.adamw_beta2), eps=args.adamw_eps,
-                                  fused=True)
-        if args.lr_schedule == "linear":
-            scheduler = get_linear_schedule_with_warmup(
-                optim, num_training_steps=num_training_steps, num_warmup_steps=args.warmup_steps)
-        elif args.lr_schedule == "constant":
-            scheduler = get_constant_schedule_with_warmup(
-                optim, num_warmup_steps=args.warmup_steps)
-        elif args.lr_schedule == "cosine":
-            scheduler = get_cosine_schedule_with_warmup(
-                optim, num_training_steps=num_training_steps, num_warmup_steps=args.warmup_steps)
+    optim = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate,
+                                betas=(args.adamw_beta1, args.adamw_beta2), eps=args.adamw_eps)
+    if args.lr_schedule == "linear":
+        scheduler = get_linear_schedule_with_warmup(
+            optim, num_training_steps=num_training_steps, num_warmup_steps=warmup_steps)
+    elif args.lr_schedule == "constant":
+        scheduler = get_constant_schedule_with_warmup(
+            optim, num_warmup_steps=warmup_steps)
+    elif args.lr_schedule == "cosine":
+        scheduler = get_cosine_schedule_with_warmup(
+            optim, num_training_steps=num_training_steps, num_warmup_steps=warmup_steps)
+    if accelerator.distributed_type != DistributedType.DEEPSPEED:
         optim, train_loader, scheduler = accelerator.prepare(
             optim, train_loader, scheduler)
+    else:
+        model, optim, train_loader, scheduler = accelerator.prepare(
+            model, optim, train_loader, scheduler)
 
-    model.gradient_checkpointing_enable()
+    if accelerator.distributed_type == DistributedType.DEEPSPEED or accelerator.distributed_type == DistributedType.FSDP:
+        model.gradient_checkpointing_enable()
 
     accelerator.register_for_checkpointing(scheduler)
 
@@ -167,15 +178,23 @@ def main(args):
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    loss_log = {"loss": loss.item(), "epoch": completed_steps / epoch_size}
+                    last_lr = scheduler.get_last_lr()
+                    if isinstance(last_lr, list):
+                        last_lr = last_lr[0]
+                    loss_log = {
+                        "loss": loss.item(),
+                        "epoch": completed_steps / (num_training_steps / args.epochs),
+                        "learning_rate": last_lr
+                    }
                     accelerator.log(loss_log, step=completed_steps)
                     if loss_file is not None:
                         loss_file.write(f"{loss_log['loss']},")
                         loss_file.flush()
+
                     if isinstance(args.grad_norm, float):
                         accelerator.clip_grad_norm_(
                             model.parameters(), args.grad_norm)
-
+                    
                 optim.step()
                 scheduler.step()
                 optim.zero_grad()
@@ -205,13 +224,13 @@ def main(args):
 
         accelerator.wait_for_everyone()
 
-        if args.deepspeed:
-            state_dict = accelerator.get_state_dict(model)
-        else:
+        if accelerator.distributed_type == DistributedType.FSDP:
             full_state_dict_config = FullStateDictConfig(
                 offload_to_cpu=True, rank0_only=True)
             with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
                 state_dict = accelerator.get_state_dict(model, unwrap=False)
+        else:
+            state_dict = accelerator.get_state_dict(model)
 
         accelerator.unwrap_model(model).save_pretrained(
             f"{args.output_dir}",
@@ -240,12 +259,12 @@ if __name__ == "__main__":
     args.add_argument("--model", type=str, required=True)
     args.add_argument("--truncate", type=int)
     args.add_argument("--dataset", type=str, required=True)
-    args.add_argument("--deepspeed", action="store_true")
     args.add_argument("--num-proc", type=int, default=32)
     args.add_argument("--lr-schedule", type=str,
                       choices=["linear", "constant", "cosine"], default="linear")
     args.add_argument("--weight-decay", type=float)
     args.add_argument("--no-decay", action="append", nargs="+")
+    args.add_argument("--frozen", action="append", nargs="+")
     args.add_argument("--adamw-beta1", type=float, default=0.9)
     args.add_argument("--adamw-beta2", type=float, default=0.999)
     args.add_argument("--adamw-eps", type=float, default=1e-8)
