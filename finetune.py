@@ -1,16 +1,16 @@
 import argparse
 import copy
-import torch
 import os
+import torch
 from datasets import load_dataset, load_from_disk, DatasetDict
 from datetime import timedelta
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
 from torch.utils.data import DataLoader
 from accelerate import Accelerator, DistributedType
-from accelerate.utils import InitProcessGroupKwargs, set_seed, DummyOptim, DummyScheduler
+from accelerate.utils import InitProcessGroupKwargs, set_seed
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, set_seed as transformers_set_seed, \
     default_data_collator, get_linear_schedule_with_warmup, get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
 
 
 def main(args):
@@ -43,6 +43,10 @@ def main(args):
         use_flash_attention_2=True,
         trust_remote_code=True
     )
+
+    if args.print_parameter_dtypes and accelerator.is_main_process:
+        for n, p in model.named_parameters():
+            print(f"{n}: {p.dtype}")
 
     try:
         train_dataset = load_dataset(args.dataset)
@@ -86,8 +90,10 @@ def main(args):
     total_batch_size = args.batch_size * accelerator.num_processes * args.gradient_accumulate_every
     epoch_size = args.max_train_steps if args.max_train_steps else len(train_dataset)
     num_training_steps = args.max_train_steps if args.max_train_steps else epoch_size * args.epochs // total_batch_size
+    num_epoch_steps = num_training_steps // args.epochs
     accelerator.print(f"Total batch size: {total_batch_size}")
-    accelerator.print(f"Training steps: {num_training_steps}")
+    accelerator.print(f"Epoch training steps: {num_epoch_steps}")
+    accelerator.print(f"Total training steps: {num_training_steps} ({args.epochs} epochs)")
 
     param_optimizer = list(model.named_parameters())
     frozen = args.frozen[0] if args.frozen else []
@@ -164,58 +170,63 @@ def main(args):
 
     if args.resume_from_checkpoint and resume_step is not None:
         train_loader = accelerator.skip_first_batches(
-            train_loader, resume_step)
+            train_loader, resume_step % num_epoch_steps)
         completed_steps += resume_step
         progress_bar.update(resume_step)
         accelerator.print(f"Resuming training from step {resume_step}")
+        epoch = resume_step // num_epoch_steps
+    else:
+        epoch = 0
 
     loss_file = open(args.log_loss, "a" if args.resume_from_checkpoint else "w", encoding="utf-8") if args.log_loss and accelerator.is_main_process else None
 
     if not args.save_only:
         model.train()
-        for _, batch in enumerate(train_loader):
-            loss_log = None
-            with accelerator.accumulate(model):
-                loss = model(**batch).loss
-                accelerator.backward(loss)
+        for _ in range(epoch, args.epochs):
+            for _, batch in enumerate(train_loader):
+                loss_log = None
+                with accelerator.accumulate(model):
+                    loss = model(**batch).loss
+                    accelerator.backward(loss)
+
+                    if accelerator.sync_gradients:
+                        last_lr = scheduler.get_last_lr()
+                        if isinstance(last_lr, list):
+                            last_lr = last_lr[0]
+                        loss_log = {
+                            "loss": loss.item(),
+                            "epoch": completed_steps / num_epoch_steps,
+                            "learning_rate": last_lr
+                        }
+                        accelerator.log(loss_log, step=completed_steps)
+                        if loss_file is not None:
+                            loss_file.write(f"{loss_log['loss']},")
+                            loss_file.flush()
+
+                        if isinstance(args.grad_norm, float):
+                            accelerator.clip_grad_norm_(
+                                model.parameters(), args.grad_norm)
+                        
+                    optim.step()
+                    scheduler.step()
+                    optim.zero_grad()
 
                 if accelerator.sync_gradients:
-                    last_lr = scheduler.get_last_lr()
-                    if isinstance(last_lr, list):
-                        last_lr = last_lr[0]
-                    loss_log = {
-                        "loss": loss.item(),
-                        "epoch": completed_steps / (num_training_steps / args.epochs),
-                        "learning_rate": last_lr
-                    }
-                    accelerator.log(loss_log, step=completed_steps)
-                    if loss_file is not None:
-                        loss_file.write(f"{loss_log['loss']},")
-                        loss_file.flush()
+                    progress_bar.update(1)
+                    if loss_log is not None:
+                        progress_bar.set_postfix(loss_log)
+                    completed_steps += 1
 
-                    if isinstance(args.grad_norm, float):
-                        accelerator.clip_grad_norm_(
-                            model.parameters(), args.grad_norm)
-                    
-                optim.step()
-                scheduler.step()
-                optim.zero_grad()
-
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                if loss_log is not None:
-                    progress_bar.set_postfix(loss_log)
-                completed_steps += 1
-
-                if isinstance(args.checkpointing_steps, int) and completed_steps > 0:
-                    if completed_steps % args.checkpointing_steps == 0:
-                        output_dir = f"step_{completed_steps}"
-                        if args.output_dir is not None:
-                            output_dir = os.path.join(
-                                args.output_dir, output_dir)
-                        accelerator.save_state(output_dir)
-
-            if completed_steps >= num_training_steps * args.epochs:
+                    if isinstance(args.checkpointing_steps, int) and completed_steps > 0:
+                        if completed_steps % args.checkpointing_steps == 0:
+                            output_dir = f"step_{completed_steps}"
+                            if args.output_dir is not None:
+                                output_dir = os.path.join(
+                                    args.output_dir, output_dir)
+                            accelerator.save_state(output_dir)
+                if completed_steps >= num_training_steps:
+                    break
+            if completed_steps >= num_training_steps:
                 break
 
         accelerator.print("Training Finished")
@@ -272,4 +283,5 @@ if __name__ == "__main__":
     args.add_argument("--adamw-eps", type=float, default=1e-8)
     args.add_argument("--save-only", action="store_true")
     args.add_argument("--log-loss", type=str)
+    args.add_argument("--print-parameter-dtypes", action="store_true")
     main(args.parse_args())
